@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: whitelabel-wpp — WhatsApp Group Analytics Platform
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  MetaVerifyToken:
+    Type: String
+    NoEcho: true
+  MetaAppSecret:
+    Type: String
+    NoEcho: true
+  MetaAccessToken:
+    Type: String
+    NoEcho: true
+  MetaPhoneNumberId:
+    Type: String
+
+Resources:
+
+  # ── SQS Queue ─────────────────────────────────────────────────────────
+  MessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub whitelabel-wpp-messages-${Stage}
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400  # 24h
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub whitelabel-wpp-dlq-${Stage}
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # ── Lambda — Webhook Receiver ─────────────────────────────────────────
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub whitelabel-wpp-webhook-${Stage}
+      Runtime: python3.12
+      Handler: webhook.handler
+      Code:
+        ZipFile: |
+          # Placeholder — replaced by deployment script
+          def handler(event, context):
+              return {"statusCode": 200, "body": "ok"}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STAGE: !Ref Stage
+          META_VERIFY_TOKEN: !Ref MetaVerifyToken
+          META_APP_SECRET: !Ref MetaAppSecret
+          META_ACCESS_TOKEN: !Ref MetaAccessToken
+          META_PHONE_NUMBER_ID: !Ref MetaPhoneNumberId
+          SQS_QUEUE_URL: !Ref MessageQueue
+      Role: !GetAtt WebhookRole.Arn
+
+  WebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub whitelabel-wpp-webhook-role-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt MessageQueue.Arn
+
+  # ── API Gateway — REST API ────────────────────────────────────────────
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub whitelabel-wpp-api-${Stage}
+      Description: WhatsApp webhook endpoint
+
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: webhook
+
+  WebhookMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref WebhookResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations
+          - Arn: !GetAtt WebhookFunction.Arn
+
+  WebhookMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref WebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations
+          - Arn: !GetAtt WebhookFunction.Arn
+
+  WebhookApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - WebhookMethodGet
+      - WebhookMethodPost
+    Properties:
+      RestApiId: !Ref WebhookApi
+
+  WebhookApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref WebhookApi
+      DeploymentId: !Ref WebhookApiDeployment
+      StageName: !Ref Stage
+
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*
+
+  # ── EventBridge — Scheduled Summaries ─────────────────────────────────
+  SummaryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub whitelabel-wpp-daily-summary-${Stage}
+      Description: Trigger daily summary generation
+      ScheduleExpression: cron(0 6 * * ? *)  # 6 AM UTC daily
+      State: DISABLED  # Enable when processor is ready
+      Targets:
+        - Arn: !GetAtt MessageQueue.Arn
+          Id: DailySummaryTarget
+          Input: '{"action": "generate_summary", "period": "daily"}'
+
+  EventBridgeToSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MessageQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt MessageQueue.Arn
+
+Outputs:
+  WebhookUrl:
+    Description: Meta webhook callback URL
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/webhook
+
+  QueueUrl:
+    Description: SQS queue URL for message processing
+    Value: !Ref MessageQueue
+
+  QueueArn:
+    Description: SQS queue ARN
+    Value: !GetAtt MessageQueue.Arn
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref WebhookApi
