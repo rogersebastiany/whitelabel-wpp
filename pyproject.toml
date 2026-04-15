@@ -1,0 +1,50 @@
+[project]
+name = "whitelabel-wpp"
+version = "0.1.0"
+description = "WhatsApp Group Analytics Platform — Meta Cloud API + Neo4j + Milvus + Cognee"
+requires-python = ">=3.12"
+dependencies = [
+    # Web framework
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+
+    # Meta Cloud API
+    "pydantic>=2.10",
+
+    # Graph database
+    "neo4j>=5.28",
+
+    # Vector databases
+    "pymilvus>=2.5",
+    "lancedb>=0.20",
+
+    # Knowledge graph extraction
+    "cognee>=0.1",
+
+    # LLM
+    "openai>=1.60",
+
+    # AWS
+    "boto3>=1.36",
+
+    # Utilities
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
