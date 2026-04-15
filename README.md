@@ -1,6 +1,6 @@
 # whitelabel-wpp
 
-WhatsApp Group Analytics Platform — white-label SaaS that listens to group conversations via Meta Cloud API, extracts insights, and lets owners query their data through WhatsApp.
+WhatsApp Group Analytics Platform — white-label SaaS that listens to group conversations via Telnyx (Meta-approved WhatsApp BSP), extracts insights, and lets owners query their data through WhatsApp.
 
 ## Features
 
@@ -13,31 +13,31 @@ WhatsApp Group Analytics Platform — white-label SaaS that listens to group con
 ## Architecture
 
 ```
-Meta Cloud API ──webhook──> API Gateway + Lambda (ingestion)
-                                    │
-                                    ▼
-                              Secrets Manager
-                                    │
-                                    ▼
-                                   SQS ◄── EventBridge Scheduler
-                                    │       (summaries, engagement,
-                                    │        topic recurrence, IQS)
-                                    ▼
-                            ECS Fargate (processing)
-                          0.25 vCPU / 0.5 GB / Spot
-                          auto-scale 0→3 on queue depth
-                           ┌────┼────┬────────┐
-                           ▼    ▼    ▼        ▼
-                        Neo4j Milvus LanceDB  Cognee
-                          │     │    (sync)     │
-                          │     ◄────────────────┘
-                          └─────┘
-                                    │
-                                    ▼
-                         Owner 1:1 Chat (query)
-                                    │
-                                    ▼
-                         Cloud API ──reply──> WhatsApp
+WhatsApp ←→ Meta ←→ Telnyx BSP ──webhook──> API Gateway + Lambda
+                                                     │
+                                                     ▼
+                                               Secrets Manager
+                                                     │
+                                                     ▼
+                                                    SQS ◄── EventBridge Scheduler
+                                                     │       (summaries, engagement,
+                                                     │        topic recurrence, IQS)
+                                                     ▼
+                                             ECS Fargate (processing)
+                                           0.25 vCPU / 0.5 GB / Spot
+                                           auto-scale 0→3 on queue depth
+                                            ┌────┼────┬────────┐
+                                            ▼    ▼    ▼        ▼
+                                         Neo4j Milvus LanceDB  Cognee
+                                           │     │    (sync)     │
+                                           │     ◄────────────────┘
+                                           └─────┘
+                                                     │
+                                                     ▼
+                                          Owner 1:1 Chat (query)
+                                                     │
+                                                     ▼
+                                          Telnyx API ──→ Meta ──→ WhatsApp
 ```
 
 ### LGPD: Process-and-Discard
@@ -51,10 +51,10 @@ No raw messages are stored anywhere. The pipeline:
 
 ### Data Flow
 
-1. **Ingestion** — Lambda validates webhook signature (X-Hub-Signature-256), parses payload, queues interaction metadata to SQS
+1. **Ingestion** — Lambda receives Telnyx webhook, parses event payload, queues interaction metadata to SQS
 2. **Processing** — ECS Fargate consumes SQS, extracts topics (Cognee → LanceDB → Milvus sync), embeds summaries (Milvus)
 3. **Analytics** — EventBridge triggers scheduled jobs: daily summaries, weekly engagement reports, topic recurrence (6h), IQS recalculation
-4. **Owner Interface** — natural language queries in 1:1 chat, resolved against Neo4j/Milvus, responses sent via Cloud API
+4. **Owner Interface** — natural language queries in 1:1 chat, resolved against Neo4j/Milvus, responses sent via Telnyx WhatsApp API
 
 ### Key Member Identification (IQS)
 
@@ -178,7 +178,7 @@ whitelabel-wpp/
 │       ├── config.py           # Secrets Manager loader, env config
 │       ├── webhook.py          # Lambda handler (deployed inline in CF)
 │       ├── models.py           # Pydantic models for all schemas
-│       ├── meta_api.py         # Meta Cloud API client (send messages, reply)
+│       ├── telnyx_client.py     # Telnyx WhatsApp API client (send messages, reply)
 │       ├── neo4j_client.py     # Neo4j driver, Cypher queries
 │       ├── milvus_client.py    # Milvus collections, embed + semantic search
 │       ├── cognee_client.py    # Cognee entity/topic extraction (writes to LanceDB)
@@ -412,36 +412,39 @@ async def handle_owner_query(message: str, owner_phone: str) -> str:
         case "member_profile": return await get_member_profile(group_id, phone)
 ```
 
-**Response via Meta Cloud API** (meta_api.py):
+**Response via Telnyx API** (telnyx_client.py):
 ```python
-async def send_reply(to: str, text: str):
-    """POST to graph.facebook.com/v21.0/{phone_number_id}/messages"""
+async def send_reply(from_number: str, to: str, text: str):
+    """POST to api.telnyx.com/v2/messages/whatsapp"""
     payload = {
-        "messaging_product": "whatsapp",
+        "from": from_number,
         "to": to,
-        "type": "text",
-        "text": {"body": text}
+        "whatsapp_message": {
+            "type": "text",
+            "text": {"body": text, "preview_url": False}
+        }
     }
 ```
 
 ### 9. Lambda Webhook Spec (webhook.py)
 
-Already deployed inline in CloudFormation. Formal spec:
+Receives Telnyx webhook events:
 
-- **GET /webhook** — Meta verification challenge-response (hub.mode, hub.verify_token, hub.challenge)
 - **POST /webhook**:
-  1. Validate `X-Hub-Signature-256` (HMAC-SHA256 of body with APP_SECRET)
-  2. Parse JSON payload
-  3. For each `entry.changes` where `field == "messages"`: send `change.value` to SQS
-  4. Return 200 immediately (Meta requires <5s response)
+  1. Parse Telnyx event envelope (`data.event_type`, `data.payload`)
+  2. Route by event type:
+     - `message.received` → extract sender, text, group context → SQS
+     - `message.delivered` / `message.read` → update delivery status (optional)
+     - `message.failed` → log error, DLQ
+  3. Return 200 immediately
 
 ### 10. Config (config.py)
 
 ```python
 class Settings:
     # From Secrets Manager
-    meta_access_token: str
-    meta_phone_number_id: str
+    telnyx_api_key: str
+    telnyx_messaging_profile_id: str
     openai_api_key: str
     neo4j_uri: str
     neo4j_password: str
@@ -457,7 +460,7 @@ class Settings:
 | Component | Technology |
 |-----------|-----------|
 | Language | Python 3.12 |
-| WhatsApp API | Meta Cloud API + Webhooks |
+| WhatsApp API | Telnyx BSP (wraps Meta WhatsApp Business Platform) |
 | Graph DB | Neo4j |
 | Vector DB (semantic search) | Milvus |
 | Vector sync bridge | LanceDB (Cognee → Milvus) |
@@ -503,25 +506,26 @@ uv sync
 cp .env.example .env  # fill in credentials
 ```
 
-## Client Onboarding — Telnyx eSIM
+## Client Onboarding — Telnyx BSP
 
-Each client gets a dedicated phone number via **Telnyx MVNO eSIM** (real mobile, not VoIP):
+Each client gets a dedicated phone number via **Telnyx DID** (Meta-approved BSP):
 
-- **GSMA-compliant eUICC** — same standard as Claro/Vivo/TIM
-- **Real cellular network** — 650+ networks, multi-IMSI (not VoIP, Meta-compatible)
-- **Programmatic provisioning** — API to order eSIMs and assign mobile numbers at scale
-- **WhatsApp-safe** — real mobile numbers pass Meta's WABA verification
+- **Telnyx is a Meta WhatsApp Business Solution Provider** — not a workaround, officially sanctioned
+- **Single vendor** — number provisioning, WABA registration, messaging API, webhooks all through Telnyx
+- **Brazilian DID numbers** — requires CPF/CNPJ + address proof, ~3 business days to approve
+- **Embedded Signup** — Telnyx handles Meta's WABA registration internally
 
 ### Onboarding flow
-1. Telnyx API → provision eSIM with Brazilian mobile number
-2. Meta Embedded Signup → register number as WABA
-3. Verify via SMS (Telnyx receives it)
-4. Webhook URL configured → client's group starts being monitored
-5. Owner phone linked → 1:1 chat interface active
+1. Telnyx API → purchase Brazilian DID number ($1/mo)
+2. Telnyx Embedded Signup → auto-registers number as WABA with Meta
+3. Phone number verified via SMS or voice call
+4. Telnyx webhook configured → our API Gateway endpoint
+5. Client's group starts being monitored
+6. Owner phone linked → 1:1 chat query interface active
 
 ### Cost per client
-- Telnyx eSIM: ~$1-5/mo per number
-- Meta API: per-conversation pricing (free for first 1,000/mo)
+- Telnyx DID number: ~$1/mo
+- Meta conversation pricing (passed through Telnyx): free for first 1,000 service conversations/mo
 - Total: low single-digit USD per client/month for infrastructure
 
 ## Multi-Tenancy
