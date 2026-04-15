@@ -17,8 +17,402 @@ Parameters:
     NoEcho: true
   MetaPhoneNumberId:
     Type: String
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  ProcessorImage:
+    Type: String
+    Default: "525320085764.dkr.ecr.sa-east-1.amazonaws.com/whitelabel-wpp:latest"
+    Description: ECR image URI for the processor service
 
 Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub whitelabel-wpp-${Stage}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub whitelabel-wpp-public-a-${Stage}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub whitelabel-wpp-public-b-${Stage}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Groups ──────────────────────────────────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # ── ALB ──────────────────────────────────────────────────────────────
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub wpp-alb-${Stage}
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub wpp-tg-${Stage}
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── ECS Cluster ──────────────────────────────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub whitelabel-wpp-${Stage}
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ── ECR Repository ───────────────────────────────────────────────────
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: whitelabel-wpp
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ── ECS Task Definition ──────────────────────────────────────────────
+  ProcessorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub whitelabel-wpp-processor-${Stage}
+      Cpu: '256'       # 0.25 vCPU — cheapest
+      Memory: '512'    # 0.5 GB — cheapest
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: processor
+          Image: !Ref ProcessorImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: STAGE
+              Value: !Ref Stage
+            - Name: SQS_QUEUE_URL
+              Value: !Ref MessageQueue
+            - Name: SECRETS_ARN
+              Value: !Ref AppSecrets
+          Secrets:
+            - Name: META_ACCESS_TOKEN
+              ValueFrom: !Sub "${AppSecrets}:META_ACCESS_TOKEN::"
+            - Name: META_PHONE_NUMBER_ID
+              ValueFrom: !Sub "${AppSecrets}:META_PHONE_NUMBER_ID::"
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub "${AppSecrets}:OPENAI_API_KEY::"
+            - Name: NEO4J_URI
+              ValueFrom: !Sub "${AppSecrets}:NEO4J_URI::"
+            - Name: NEO4J_PASSWORD
+              ValueFrom: !Sub "${AppSecrets}:NEO4J_PASSWORD::"
+            - Name: MILVUS_URI
+              ValueFrom: !Sub "${AppSecrets}:MILVUS_URI::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProcessorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: processor
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/whitelabel-wpp-processor-${Stage}
+      RetentionInDays: 14
+
+  # ── ECS Service ──────────────────────────────────────────────────────
+  ProcessorService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub whitelabel-wpp-processor-${Stage}
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ProcessorTaskDefinition
+      DesiredCount: 0  # Start at 0, auto-scale up when messages arrive
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: processor
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── ECS Auto Scaling ─────────────────────────────────────────────────
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 3
+      MinCapacity: 0
+      ResourceId: !Sub service/${ECSCluster}/${ProcessorService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  # Scale up when SQS has messages waiting
+  ScaleUpPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub wpp-scale-up-${Stage}
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 120
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 50
+            ScalingAdjustment: 1
+          - MetricIntervalLowerBound: 50
+            ScalingAdjustment: 2
+
+  # Scale down when queue is empty
+  ScaleDownPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub wpp-scale-down-${Stage}
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 300
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+
+  # CloudWatch alarm: SQS messages visible > 0
+  QueueNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub wpp-queue-not-empty-${Stage}
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MessageQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  # CloudWatch alarm: SQS queue empty for 5 min
+  QueueEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub wpp-queue-empty-${Stage}
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MessageQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+  # ── IAM Roles ────────────────────────────────────────────────────────
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub whitelabel-wpp-ecs-exec-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AppSecrets
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub whitelabel-wpp-ecs-task-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSConsumeMessages
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt MessageQueue.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ProcessorLogGroup.Arn
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub whitelabel-wpp-autoscale-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
 
   # ── SQS Queue ─────────────────────────────────────────────────────────
   MessageQueue:
@@ -26,7 +420,7 @@ Resources:
     Properties:
       QueueName: !Sub whitelabel-wpp-messages-${Stage}
       VisibilityTimeout: 300
-      MessageRetentionPeriod: 86400  # 24h
+      MessageRetentionPeriod: 86400
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
         maxReceiveCount: 3
@@ -35,7 +429,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub whitelabel-wpp-dlq-${Stage}
-      MessageRetentionPeriod: 1209600  # 14 days
+      MessageRetentionPeriod: 1209600
 
   # ── Lambda — Webhook Receiver ─────────────────────────────────────────
   WebhookFunction:
@@ -43,12 +437,58 @@ Resources:
     Properties:
       FunctionName: !Sub whitelabel-wpp-webhook-${Stage}
       Runtime: python3.12
-      Handler: webhook.handler
+      Handler: index.handler
       Code:
         ZipFile: |
-          # Placeholder — replaced by deployment script
+          import json
+          import hashlib
+          import hmac
+          import os
+          import boto3
+
+          sqs = boto3.client('sqs')
+          QUEUE_URL = os.environ['SQS_QUEUE_URL']
+          VERIFY_TOKEN = os.environ['META_VERIFY_TOKEN']
+          APP_SECRET = os.environ['META_APP_SECRET']
+
           def handler(event, context):
-              return {"statusCode": 200, "body": "ok"}
+              method = event.get('httpMethod', '')
+
+              # GET — webhook verification
+              if method == 'GET':
+                  params = event.get('queryStringParameters') or {}
+                  mode = params.get('hub.mode')
+                  token = params.get('hub.verify_token')
+                  challenge = params.get('hub.challenge')
+                  if mode == 'subscribe' and token == VERIFY_TOKEN:
+                      return {'statusCode': 200, 'body': challenge}
+                  return {'statusCode': 403, 'body': 'Forbidden'}
+
+              # POST — incoming webhook event
+              if method == 'POST':
+                  body = event.get('body', '')
+                  signature = (event.get('headers') or {}).get('x-hub-signature-256', '')
+
+                  # Validate signature
+                  expected = 'sha256=' + hmac.new(
+                      APP_SECRET.encode(), body.encode(), hashlib.sha256
+                  ).hexdigest()
+                  if not hmac.compare_digest(signature, expected):
+                      return {'statusCode': 401, 'body': 'Invalid signature'}
+
+                  # Parse and queue
+                  payload = json.loads(body)
+                  for entry in payload.get('entry', []):
+                      for change in entry.get('changes', []):
+                          if change.get('field') == 'messages':
+                              sqs.send_message(
+                                  QueueUrl=QUEUE_URL,
+                                  MessageBody=json.dumps(change['value']),
+                              )
+
+                  return {'statusCode': 200, 'body': 'ok'}
+
+              return {'statusCode': 405, 'body': 'Method not allowed'}
       Timeout: 30
       MemorySize: 256
       Environment:
@@ -84,7 +524,7 @@ Resources:
                   - sqs:SendMessage
                 Resource: !GetAtt MessageQueue.Arn
 
-  # ── API Gateway — REST API ────────────────────────────────────────────
+  # ── API Gateway ──────────────────────────────────────────────────────
   WebhookApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -149,18 +589,61 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*
 
-  # ── EventBridge — Scheduled Summaries ─────────────────────────────────
+  # ── Secrets Manager ───────────────────────────────────────────────────
+  AppSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub whitelabel-wpp/${Stage}/credentials
+      Description: All application credentials
+      SecretString: !Sub |
+        {
+          "META_VERIFY_TOKEN": "${MetaVerifyToken}",
+          "META_APP_SECRET": "${MetaAppSecret}",
+          "META_ACCESS_TOKEN": "${MetaAccessToken}",
+          "META_PHONE_NUMBER_ID": "${MetaPhoneNumberId}",
+          "OPENAI_API_KEY": "",
+          "NEO4J_URI": "",
+          "NEO4J_USER": "neo4j",
+          "NEO4J_PASSWORD": "",
+          "MILVUS_URI": ""
+        }
+
+  # ── EventBridge — Scheduled Jobs ─────────────────────────────────────
   SummaryScheduleRule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub whitelabel-wpp-daily-summary-${Stage}
-      Description: Trigger daily summary generation
-      ScheduleExpression: cron(0 6 * * ? *)  # 6 AM UTC daily
-      State: DISABLED  # Enable when processor is ready
+      Description: Generate daily discussion summaries
+      ScheduleExpression: cron(0 6 * * ? *)
+      State: DISABLED
       Targets:
         - Arn: !GetAtt MessageQueue.Arn
           Id: DailySummaryTarget
           Input: '{"action": "generate_summary", "period": "daily"}'
+
+  WeeklyEngagementRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub whitelabel-wpp-weekly-engagement-${Stage}
+      Description: Weekly engagement report and IQS recalculation
+      ScheduleExpression: cron(0 7 ? * MON *)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt MessageQueue.Arn
+          Id: WeeklyEngagementTarget
+          Input: '{"action": "engagement_report", "period": "weekly"}'
+
+  TopicRecurrenceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub whitelabel-wpp-topic-recurrence-${Stage}
+      Description: Analyze recurrent topics every 6 hours
+      ScheduleExpression: rate(6 hours)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt MessageQueue.Arn
+          Id: TopicRecurrenceTarget
+          Input: '{"action": "topic_recurrence"}'
 
   EventBridgeToSQSPolicy:
     Type: AWS::SQS::QueuePolicy
@@ -182,13 +665,25 @@ Outputs:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/webhook
 
   QueueUrl:
-    Description: SQS queue URL for message processing
+    Description: SQS queue URL
     Value: !Ref MessageQueue
 
-  QueueArn:
-    Description: SQS queue ARN
-    Value: !GetAtt MessageQueue.Arn
+  ALBDnsName:
+    Description: ALB DNS name (processor service)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
 
-  ApiId:
-    Description: API Gateway ID
-    Value: !Ref WebhookApi
+  ECRRepositoryUri:
+    Description: ECR repository URI for docker push
+    Value: !GetAtt ECRRepository.RepositoryUri
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+
+  SecretsArn:
+    Description: Secrets Manager ARN
+    Value: !Ref AppSecrets
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
