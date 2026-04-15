@@ -503,6 +503,19 @@ uv sync
 cp .env.example .env  # fill in credentials
 ```
 
+## Multi-Tenancy
+
+Shared instances, partitioned by tenant (group_id / owner_phone). No isolated databases per tenant.
+
+| Service | Isolation | How |
+|---------|-----------|-----|
+| **Neo4j** | `group_id` on every query | All Cypher traversals start from `(:Group {group_id})` which is linked to a single `(:Owner)`. No cross-tenant path exists. |
+| **Milvus** | `group_id` partition key | Every vector has `group_id` field. All searches include `expr="group_id == '...'"`. Milvus partition key ensures physical separation. |
+| **Cognee** | Namespace per tenant | `cognee.config.set("namespace", group_id)` before extraction. LanceDB writes scoped to namespace. |
+| **LanceDB → Milvus sync** | Namespace → group_id | Sync reads LanceDB by namespace, writes to Milvus with matching `group_id`. |
+| **SQS** | Payload carries group_id | Webhook payload includes group JID. Processor routes by it. |
+| **Owner chat** | owner_phone → group lookup | `MATCH (o:Owner {phone: $phone})-[:OWNS]->(g:Group) RETURN g.group_id` — owner can only query their own groups. |
+
 ## Compliance
 
 - LGPD compliant — process-and-discard, no raw message storage
