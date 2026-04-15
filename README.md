@@ -503,6 +503,27 @@ uv sync
 cp .env.example .env  # fill in credentials
 ```
 
+## Client Onboarding — Telnyx eSIM
+
+Each client gets a dedicated phone number via **Telnyx MVNO eSIM** (real mobile, not VoIP):
+
+- **GSMA-compliant eUICC** — same standard as Claro/Vivo/TIM
+- **Real cellular network** — 650+ networks, multi-IMSI (not VoIP, Meta-compatible)
+- **Programmatic provisioning** — API to order eSIMs and assign mobile numbers at scale
+- **WhatsApp-safe** — real mobile numbers pass Meta's WABA verification
+
+### Onboarding flow
+1. Telnyx API → provision eSIM with Brazilian mobile number
+2. Meta Embedded Signup → register number as WABA
+3. Verify via SMS (Telnyx receives it)
+4. Webhook URL configured → client's group starts being monitored
+5. Owner phone linked → 1:1 chat interface active
+
+### Cost per client
+- Telnyx eSIM: ~$1-5/mo per number
+- Meta API: per-conversation pricing (free for first 1,000/mo)
+- Total: low single-digit USD per client/month for infrastructure
+
 ## Multi-Tenancy
 
 Shared instances, partitioned by tenant (group_id / owner_phone). No isolated databases per tenant.
