@@ -162,6 +162,294 @@ All rules disabled until processor is deployed.
 - **Log group**: `/ecs/whitelabel-wpp-processor-dev` (14 day retention)
 - **Alarms**: SQS queue depth (triggers auto-scale up/down)
 
+## Spec-Driven Design
+
+### 1. Project Structure
+
+```
+whitelabel-wpp/
+├── infra/
+│   └── template.yaml          # CloudFormation
+├── src/
+│   └── whitelabel_wpp/
+│       ├── __init__.py
+│       ├── main.py             # FastAPI app + SQS consumer loop
+│       ├── config.py           # Secrets Manager loader, env config
+│       ├── webhook.py          # Lambda handler (deployed inline in CF)
+│       ├── models.py           # Pydantic models for all schemas
+│       ├── meta_api.py         # Meta Cloud API client (send messages, reply)
+│       ├── neo4j_client.py     # Neo4j driver, Cypher queries
+│       ├── milvus_client.py    # Milvus collections, embed + search
+│       ├── cognee_client.py    # Cognee entity/topic extraction
+│       ├── lancedb_client.py   # LanceDB hybrid search
+│       ├── processor.py        # SQS message handler (dispatch by action)
+│       ├── analytics/
+│       │   ├── __init__.py
+│       │   ├── summarizer.py   # Discussion summary generation
+│       │   ├── topics.py       # Recurrent topic detection + dedup
+│       │   ├── iqs.py          # Interaction Quality Score calculation
+│       │   └── engagement.py   # Engagement metrics aggregation
+│       └── owner_chat/
+│           ├── __init__.py
+│           ├── intent.py       # NL intent classification
+│           └── handler.py      # Query routing + response formatting
+├── tests/
+├── Dockerfile
+├── pyproject.toml
+├── .env.example
+└── README.md
+```
+
+### 2. SQS Message Schemas
+
+**message_received** (from Lambda webhook):
+```json
+{
+  "action": "message_received",
+  "messaging_product": "whatsapp",
+  "metadata": {"display_phone_number": "...", "phone_number_id": "..."},
+  "contacts": [{"profile": {"name": "..."}, "wa_id": "5511999999999"}],
+  "messages": [{
+    "id": "wamid.xxx",
+    "from": "5511999999999",
+    "timestamp": "1681234567",
+    "type": "text",
+    "text": {"body": "message content here"},
+    "context": {"message_id": "wamid.yyy"}
+  }],
+  "group": {"id": "group_jid", "subject": "Group Name"}
+}
+```
+
+**Scheduled actions** (from EventBridge):
+```json
+{"action": "generate_summary", "period": "daily"}
+{"action": "engagement_report", "period": "weekly"}
+{"action": "topic_recurrence"}
+```
+
+### 3. Processor Dispatch (processor.py)
+
+```python
+ACTION_HANDLERS = {
+    "message_received": handle_message,
+    "generate_summary": handle_summary,
+    "engagement_report": handle_engagement,
+    "topic_recurrence": handle_topics,
+}
+```
+
+**handle_message** flow:
+1. Parse SQS message → Pydantic model
+2. Check if group message or 1:1 owner message
+3. If owner 1:1 → route to `owner_chat.handler`
+4. If group message:
+   - a. Store interaction metadata in Neo4j (no text)
+   - b. Extract topics via Cognee (text in memory only)
+   - c. Store topic nodes + edges in Neo4j
+   - d. Embed topics in Milvus (semantic dedup cosine > 0.85)
+   - e. Discard raw text
+
+**handle_summary** flow:
+1. For each active group:
+   - a. Query Neo4j: all interactions in period
+   - b. Query Milvus: topic embeddings for the period
+   - c. LLM summarization (OpenAI) — input: topic clusters + interaction patterns
+   - d. Store Summary node in Neo4j
+   - e. Embed summary in Milvus
+
+**handle_engagement** flow:
+1. For each active group:
+   - a. Run IQS Cypher queries
+   - b. Run engagement metric aggregation
+   - c. Update Member nodes in Neo4j
+   - d. Optionally notify owner via Cloud API
+
+**handle_topics** flow:
+1. For each active group:
+   - a. Query Neo4j: topics with MENTIONED_IN edges
+   - b. Calculate recurrence score per topic
+   - c. Milvus semantic dedup: merge near-duplicate topics (cosine > 0.85)
+   - d. Update topic recurrence scores
+
+### 4. FastAPI Endpoints (main.py)
+
+```
+GET  /health                → 200 {"status": "ok"}
+POST /process               → Manual trigger (dev only)
+GET  /metrics/{group_id}    → Engagement metrics JSON
+GET  /summary/{group_id}    → Latest summary
+GET  /iqs/{group_id}        → IQS leaderboard
+```
+
+The main loop is a background asyncio task polling SQS — not an HTTP-driven consumer.
+
+### 5. Neo4j Cypher Specifications
+
+**Store interaction:**
+```cypher
+MERGE (m:Member {phone: $phone})
+ON CREATE SET m.lid = $lid, m.name = $name
+MERGE (g:Group {group_id: $group_id})
+CREATE (i:Interaction {msg_id: $msg_id, timestamp: $timestamp, has_media: $has_media})
+CREATE (m)-[:SENT]->(i)
+CREATE (i)-[:IN_GROUP]->(g)
+// If reply:
+MATCH (parent:Interaction {msg_id: $reply_to_msg_id})
+CREATE (i)-[:REPLIES_TO]->(parent)
+```
+
+**IQS — Reply depth** (how often does member reply to others):
+```cypher
+MATCH (m:Member {phone: $phone})-[:SENT]->(i:Interaction)-[:REPLIES_TO]->(parent)<-[:SENT]-(other:Member)
+WHERE other.phone <> m.phone AND i.timestamp > $since
+RETURN count(i) AS reply_depth
+```
+
+**IQS — Insight engagement** (how many replies did member's messages get):
+```cypher
+MATCH (m:Member {phone: $phone})-[:SENT]->(i:Interaction)<-[:REPLIES_TO]-(reply:Interaction)
+WHERE i.timestamp > $since
+RETURN count(reply) AS insight_engagement
+```
+
+**IQS — Unique repliers** (how many different people reply to member):
+```cypher
+MATCH (m:Member {phone: $phone})-[:SENT]->(i:Interaction)<-[:REPLIES_TO]-(reply)<-[:SENT]-(replier:Member)
+WHERE i.timestamp > $since AND replier.phone <> m.phone
+RETURN count(DISTINCT replier) AS unique_repliers
+```
+
+**IQS formula:** `IQS = (reply_depth × 0.3) + (insight_engagement × 0.4) + (unique_repliers × 0.3)`
+
+**Recurrent topics:**
+```cypher
+MATCH (t:Topic)-[r:RECURS_IN]->(g:Group {group_id: $group_id})
+WHERE r.last_seen > $since
+RETURN t.name, r.count, r.last_seen
+ORDER BY r.count DESC LIMIT 20
+```
+
+**Engagement metrics:**
+```cypher
+MATCH (m:Member)-[:SENT]->(i:Interaction)-[:IN_GROUP]->(g:Group {group_id: $group_id})
+WHERE i.timestamp > $since
+WITH m, count(i) AS msg_count,
+     count(CASE WHEN i.has_media THEN 1 END) AS media_count,
+     collect(DISTINCT date(datetime({epochSeconds: toInteger(i.timestamp)}))) AS active_days
+RETURN m.phone, m.name, msg_count, media_count, size(active_days) AS active_day_count
+ORDER BY msg_count DESC
+```
+
+### 6. Milvus Collections
+
+**topics:**
+| Field | Type | Notes |
+|-------|------|-------|
+| id | int64 | PK, auto |
+| topic_name | varchar | |
+| group_id | varchar | |
+| embedding | float_vector[1536] | OpenAI text-embedding-3-small |
+| created_at | int64 | epoch |
+
+Index: HNSW (M=16, efConstruction=256). Dedup: cosine > 0.85 = merge.
+
+**summaries:**
+| Field | Type | Notes |
+|-------|------|-------|
+| id | int64 | PK, auto |
+| group_id | varchar | |
+| period_start | int64 | epoch |
+| period_end | int64 | epoch |
+| summary_text | varchar | Aggregated, no individual messages |
+| embedding | float_vector[1536] | |
+
+Index: HNSW. Use: cross-period retrieval, owner chat queries.
+
+### 7. Cognee Integration (cognee_client.py)
+
+```python
+async def extract_topics(text: str, group_id: str) -> list[Topic]:
+    """
+    Process-and-discard: text enters, topics leave. Text is never stored.
+
+    1. cognee.add(text) — in-memory only
+    2. cognee.cognify() — extract entities + relationships
+    3. cognee.search("GRAPH_COMPLETION", query=text) — structured output
+    4. Return list of Topic(name, entity_type, related_topics)
+    5. Text reference released — GC collects
+    """
+```
+
+### 8. Owner Chat Interface
+
+**Intent classification** (intent.py):
+```python
+INTENTS = {
+    "summary":        ["summary", "summarize", "what happened", "recap"],
+    "key_members":    ["who", "contributors", "key members", "top"],
+    "topics":         ["topics", "recurring", "what keeps", "common themes"],
+    "engagement":     ["engagement", "how active", "metrics", "stats"],
+    "member_profile": ["+55", "phone", "member", "about"],
+}
+```
+
+LLM-based intent classification with fallback to keyword matching.
+
+**Query routing** (handler.py):
+```python
+async def handle_owner_query(message: str, owner_phone: str) -> str:
+    intent = classify_intent(message)
+    group_id = resolve_owner_group(owner_phone)
+
+    match intent:
+        case "summary":       return await get_or_generate_summary(group_id, period)
+        case "key_members":   return await get_iqs_leaderboard(group_id)
+        case "topics":        return await get_recurrent_topics(group_id)
+        case "engagement":    return await get_engagement_report(group_id)
+        case "member_profile": return await get_member_profile(group_id, phone)
+```
+
+**Response via Meta Cloud API** (meta_api.py):
+```python
+async def send_reply(to: str, text: str):
+    """POST to graph.facebook.com/v21.0/{phone_number_id}/messages"""
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text}
+    }
+```
+
+### 9. Lambda Webhook Spec (webhook.py)
+
+Already deployed inline in CloudFormation. Formal spec:
+
+- **GET /webhook** — Meta verification challenge-response (hub.mode, hub.verify_token, hub.challenge)
+- **POST /webhook**:
+  1. Validate `X-Hub-Signature-256` (HMAC-SHA256 of body with APP_SECRET)
+  2. Parse JSON payload
+  3. For each `entry.changes` where `field == "messages"`: send `change.value` to SQS
+  4. Return 200 immediately (Meta requires <5s response)
+
+### 10. Config (config.py)
+
+```python
+class Settings:
+    # From Secrets Manager
+    meta_access_token: str
+    meta_phone_number_id: str
+    openai_api_key: str
+    neo4j_uri: str
+    neo4j_password: str
+    milvus_uri: str
+
+    # From env
+    sqs_queue_url: str
+    stage: str
+```
+
 ## Stack
 
 | Component | Technology |
