@@ -15,12 +15,12 @@ dependencies = [
     # Graph database
     "neo4j>=5.28",
 
-    # Vector databases
+    # Vector DB (semantic search)
     "pymilvus>=2.5",
-    "lancedb>=0.20",
 
-    # Knowledge graph extraction
+    # KG extraction (uses LanceDB internally, synced to Milvus)
     "cognee>=0.1",
+    "lancedb>=0.20",
 
     # LLM
     "openai>=1.60",

@@ -28,9 +28,10 @@ Meta Cloud API ──webhook──> API Gateway + Lambda (ingestion)
                           auto-scale 0→3 on queue depth
                            ┌────┼────┬────────┐
                            ▼    ▼    ▼        ▼
-                        Neo4j Milvus LanceDB Cognee
-                           │    │    │        │
-                           └────┴────┴────────┘
+                        Neo4j Milvus LanceDB  Cognee
+                          │     │    (sync)     │
+                          │     ◄────────────────┘
+                          └─────┘
                                     │
                                     ▼
                          Owner 1:1 Chat (query)
@@ -51,7 +52,7 @@ No raw messages are stored anywhere. The pipeline:
 ### Data Flow
 
 1. **Ingestion** — Lambda validates webhook signature (X-Hub-Signature-256), parses payload, queues interaction metadata to SQS
-2. **Processing** — ECS Fargate consumes SQS, extracts topics (Cognee), embeds summaries (Milvus), indexes for hybrid search (LanceDB)
+2. **Processing** — ECS Fargate consumes SQS, extracts topics (Cognee → LanceDB → Milvus sync), embeds summaries (Milvus)
 3. **Analytics** — EventBridge triggers scheduled jobs: daily summaries, weekly engagement reports, topic recurrence (6h), IQS recalculation
 4. **Owner Interface** — natural language queries in 1:1 chat, resolved against Neo4j/Milvus, responses sent via Cloud API
 
@@ -179,9 +180,9 @@ whitelabel-wpp/
 │       ├── models.py           # Pydantic models for all schemas
 │       ├── meta_api.py         # Meta Cloud API client (send messages, reply)
 │       ├── neo4j_client.py     # Neo4j driver, Cypher queries
-│       ├── milvus_client.py    # Milvus collections, embed + search
-│       ├── cognee_client.py    # Cognee entity/topic extraction
-│       ├── lancedb_client.py   # LanceDB hybrid search
+│       ├── milvus_client.py    # Milvus collections, embed + semantic search
+│       ├── cognee_client.py    # Cognee entity/topic extraction (writes to LanceDB)
+│       ├── sync.py             # LanceDB → Milvus vector sync (Cognee compat layer)
 │       ├── processor.py        # SQS message handler (dispatch by action)
 │       ├── analytics/
 │       │   ├── __init__.py
@@ -245,10 +246,11 @@ ACTION_HANDLERS = {
 3. If owner 1:1 → route to `owner_chat.handler`
 4. If group message:
    - a. Store interaction metadata in Neo4j (no text)
-   - b. Extract topics via Cognee (text in memory only)
-   - c. Store topic nodes + edges in Neo4j
-   - d. Embed topics in Milvus (semantic dedup cosine > 0.85)
-   - e. Discard raw text
+   - b. Extract topics via Cognee (text in memory only → LanceDB)
+   - c. Sync LanceDB → Milvus (vector transfer, no re-embedding)
+   - d. Store topic nodes + edges in Neo4j
+   - e. Milvus semantic dedup (cosine > 0.85 = merge)
+   - f. Discard raw text
 
 **handle_summary** flow:
 1. For each active group:
@@ -457,8 +459,8 @@ class Settings:
 | Language | Python 3.12 |
 | WhatsApp API | Meta Cloud API + Webhooks |
 | Graph DB | Neo4j |
-| Vector DB | Milvus |
-| Hybrid Search | LanceDB |
+| Vector DB (semantic search) | Milvus |
+| Vector sync bridge | LanceDB (Cognee → Milvus) |
 | KG Extraction | Cognee |
 | LLM | OpenAI |
 | Web Framework | FastAPI |
