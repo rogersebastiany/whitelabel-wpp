@@ -55,17 +55,67 @@ async def _handle_summary(
     group_id: str, group_name: str,
     neo4j: Neo4jClient, milvus: MilvusClient,
 ) -> str:
-    # Try existing summary first
-    summary = await neo4j.get_latest_summary(group_id)
-    if summary:
-        return f"📋 *{group_name} — Latest Summary*\n\n{summary['text']}"
+    since = str(int(time.time()) - 604800)
 
-    # Search Milvus for relevant summaries
-    hits = milvus.search_summaries("recent activity", group_id, limit=1)
-    if hits:
-        return f"📋 *{group_name}*\n\n{hits[0]['summary_text']}"
+    topics = await neo4j.get_recurrent_topics(group_id, since)
+    engagement = await neo4j.get_engagement(group_id, since)
+    interaction_count = await neo4j.get_interaction_count(group_id, since)
 
-    return f"No summaries available yet for {group_name}. I need more conversations to generate one."
+    if interaction_count == 0:
+        return f"No activity in {group_name} this week."
+
+    topic_names = [t["name"] for t in topics[:7]]
+    member_names = [(m.name or m.phone) for m in engagement[:5]]
+
+    blurb = await _mini_summary(group_name, topic_names, len(engagement), interaction_count)
+
+    lines = [f"📋 *{group_name} — 7 days*\n"]
+    if blurb:
+        lines.append(f"{blurb}\n")
+    lines.append(f"{interaction_count} msgs, {len(engagement)} members\n")
+
+    if topics:
+        lines.append("*Topics:*")
+        for t in topics[:7]:
+            lines.append(f"• {t['name']} ({t['count']}x)")
+
+    if engagement:
+        lines.append("\n*Most active:*")
+        for m in engagement[:5]:
+            name = m.name or m.phone
+            lines.append(f"• {name}: {m.messages_sent} msgs")
+
+    return "\n".join(lines)
+
+
+async def _mini_summary(
+    group_name: str, topics: list[str], member_count: int, msg_count: int,
+) -> str:
+    import openai as oai
+    from whitelabel_wpp.config import get_settings
+
+    key = get_settings().openai_api_key
+    if not key or not topics:
+        return ""
+
+    try:
+        client = oai.AsyncOpenAI(api_key=key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Group '{group_name}': {msg_count} messages, {member_count} members, "
+                    f"topics: {', '.join(topics)}. "
+                    "Write a 1-2 sentence summary in Portuguese (BR). Be concise."
+                ),
+            }],
+            max_tokens=100,
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception:
+        return ""
 
 
 async def _handle_key_members(

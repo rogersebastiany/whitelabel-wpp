@@ -459,19 +459,94 @@ class Settings:
 
 | Component | Technology |
 |-----------|-----------|
-| Language | Python 3.12 |
-| WhatsApp API | Telnyx BSP (wraps Meta WhatsApp Business Platform) |
+| Language | Python 3.12, Go 1.24 |
+| WhatsApp (local POC) | whatsmeow via Go bridge (`bridge/`) |
+| WhatsApp (production) | Telnyx BSP (Meta-approved) |
 | Graph DB | Neo4j |
-| Vector DB (semantic search) | Milvus |
-| Vector sync bridge | LanceDB (Cognee → Milvus) |
-| KG Extraction | Cognee |
+| Vector DB | Milvus (etcd + MinIO) |
+| Topic Extraction | OpenAI GPT-4o-mini |
 | LLM | OpenAI |
 | Web Framework | FastAPI |
 | IaC | CloudFormation |
 | Infrastructure | AWS (Lambda, API Gateway, SQS, ECS Fargate, ALB, ECR, Secrets Manager, EventBridge, CloudWatch) |
 | Package Manager | uv |
 
-## Deploy
+## Local POC
+
+### Prerequisites
+
+- Go 1.24+
+- Python 3.12+ with `uv`
+- Docker + Docker Compose
+- OpenAI API key
+
+### Setup
+
+```bash
+# 1. Install dependencies
+uv sync
+cd bridge && go build -o wpp-bridge . && cd ..
+
+# 2. Start infrastructure (Neo4j, Milvus, etcd, MinIO, Attu)
+docker compose up -d
+
+# 3. Configure
+cp .env.example .env
+# Fill in: OPENAI_API_KEY, OWNER_PHONE
+
+# 4. Start FastAPI processor
+uv run uvicorn whitelabel_wpp.main:app --port 8001
+
+# 5. Start WhatsApp bridge (separate terminal)
+cd bridge && ./wpp-bridge --webhook=http://localhost:8001/webhook/whatsmeow --owner=YOUR_PHONE
+# First run: scan QR code from WhatsApp → Settings → Linked Devices
+# Subsequent runs: reconnects automatically from session.db
+```
+
+### Ports
+
+| Service | Port |
+|---------|------|
+| FastAPI | 8001 |
+| Bridge send API | 8080 |
+| Neo4j Browser | 17474 |
+| Neo4j Bolt | 17687 |
+| Milvus gRPC | 19531 |
+| Attu (Milvus UI) | 3000 |
+| MinIO Console | 19001 |
+
+### Owner Chat Commands
+
+Send these in a 1:1 WhatsApp chat with the linked device:
+
+| Command | What it does |
+|---------|-------------|
+| **summary** / resumo | Weekly summary — topics, activity, short LLM blurb |
+| **topics** / temas / assuntos | Recurring topics list |
+| **key members** / quem / destaque | IQS leaderboard |
+| **engagement** / metrics / stats | Activity metrics (7 days) |
+| **+5511...** / member / membro | Member profile by phone |
+
+### Register an Owner
+
+```bash
+uv run python -c "
+import asyncio
+from dotenv import load_dotenv; load_dotenv()
+from whitelabel_wpp.config import get_settings
+from whitelabel_wpp.neo4j_client import Neo4jClient
+
+async def setup():
+    neo4j = Neo4jClient(get_settings())
+    await neo4j.register_owner('PHONE', 'NAME')
+    await neo4j.link_owner_group('PHONE', 'GROUP_JID')
+    await neo4j.close()
+
+asyncio.run(setup())
+"
+```
+
+## Deploy (Production — Telnyx)
 
 ```bash
 # Create stack
@@ -485,25 +560,11 @@ aws cloudformation create-stack \
     ParameterKey=MetaAccessToken,ParameterValue=YOUR_ACCESS_TOKEN \
     ParameterKey=MetaPhoneNumberId,ParameterValue=YOUR_PHONE_ID
 
-# Update stack
-aws cloudformation update-stack \
-  --stack-name whitelabel-wpp-dev \
-  --template-body file://infra/template.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameters ParameterKey=Stage,ParameterValue=dev ...
-
 # Push docker image
 aws ecr get-login-password --region sa-east-1 | docker login --username AWS --password-stdin 525320085764.dkr.ecr.sa-east-1.amazonaws.com
 docker build -t whitelabel-wpp .
 docker tag whitelabel-wpp:latest 525320085764.dkr.ecr.sa-east-1.amazonaws.com/whitelabel-wpp:latest
 docker push 525320085764.dkr.ecr.sa-east-1.amazonaws.com/whitelabel-wpp:latest
-```
-
-## Setup (local dev)
-
-```bash
-uv sync
-cp .env.example .env  # fill in credentials
 ```
 
 ## Client Onboarding — Telnyx BSP
@@ -536,8 +597,7 @@ Shared instances, partitioned by tenant (group_id / owner_phone). No isolated da
 |---------|-----------|-----|
 | **Neo4j** | `group_id` on every query | All Cypher traversals start from `(:Group {group_id})` which is linked to a single `(:Owner)`. No cross-tenant path exists. |
 | **Milvus** | `group_id` partition key | Every vector has `group_id` field. All searches include `expr="group_id == '...'"`. Milvus partition key ensures physical separation. |
-| **Cognee** | Namespace per tenant | `cognee.config.set("namespace", group_id)` before extraction. LanceDB writes scoped to namespace. |
-| **LanceDB → Milvus sync** | Namespace → group_id | Sync reads LanceDB by namespace, writes to Milvus with matching `group_id`. |
+| **Topic extraction** | `group_id` in payload | Topics extracted per message, stored in Neo4j and Milvus with `group_id`. |
 | **SQS** | Payload carries group_id | Webhook payload includes group JID. Processor routes by it. |
 | **Owner chat** | owner_phone → group lookup | `MATCH (o:Owner {phone: $phone})-[:OWNS]->(g:Group) RETURN g.group_id` — owner can only query their own groups. |
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,7 +26,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var client *whatsmeow.Client
+var (
+	client  *whatsmeow.Client
+	sentIDs sync.Map // track message IDs we sent, to ignore echoes
+)
 
 // WebhookPayload is what we POST to the Python app on every incoming message.
 type WebhookPayload struct {
@@ -148,6 +152,11 @@ func main() {
 func handleEvent(evt interface{}, webhookURL, ownerPhone string) {
 	msg, ok := evt.(*events.Message)
 	if !ok {
+		return
+	}
+
+	// Ignore echoes of messages we sent
+	if _, wasSent := sentIDs.LoadAndDelete(msg.Info.ID); wasSent {
 		return
 	}
 
@@ -290,6 +299,7 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sentIDs.Store(resp.ID, true)
 	slog.Info("sent message", "to", req.To, "id", resp.ID, "ts", resp.Timestamp.Format(time.RFC3339))
 
 	w.Header().Set("Content-Type", "application/json")
