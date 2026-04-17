@@ -54,9 +54,10 @@ class Processor:
                 neo4j=self.neo4j,
                 milvus=self.milvus,
             )
-            await self.telnyx.send_text(
-                self.business_number, msg.sender_phone, response,
-            )
+            if response:
+                await self.telnyx.send_text(
+                    self.business_number, msg.sender_phone, response,
+                )
             return
 
         # BDD: Store interaction metadata (no text) — LGPD

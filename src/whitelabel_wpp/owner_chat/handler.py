@@ -48,14 +48,7 @@ async def handle_owner_query(
         case "member_profile":
             return await _handle_member_profile(message, group_id, neo4j)
         case _:
-            return (
-                "I can help you with:\n"
-                "• *summary* — group discussion summary\n"
-                "• *key members* — who contributes most\n"
-                "• *topics* — recurring themes\n"
-                "• *engagement* — activity metrics\n"
-                "• *+5511...* — member profile"
-            )
+            return ""
 
 
 async def _handle_summary(

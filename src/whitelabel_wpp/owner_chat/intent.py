@@ -11,7 +11,7 @@ INTENTS: list[tuple[str, list[str]]] = [
     ("summary", ["summary", "summarize", "what happened", "recap", "discuss", "resumo", "resumir"]),
     ("key_members", ["who are", "contributors", "key members", "top contributors", "quem", "contribui", "destaque"]),
     ("engagement", ["engagement", "how active", "metrics", "stats", "ativo", "métricas", "estatísticas"]),
-    ("member_profile", ["+55", "phone", "member", "about", "telefone", "membro", "sobre"]),
+    ("member_profile", ["+55", "phone", "member", "profile", "about", "telefone", "membro", "perfil", "sobre"]),
 ]
 
 
