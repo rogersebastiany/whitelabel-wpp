@@ -74,7 +74,7 @@ class Processor:
 
         # BDD: Extract topics via Cognee (text in memory only)
         if msg.text:
-            topics = await extract_topics(msg.text, msg.group_id)
+            topics = await extract_topics(msg.text, msg.group_id, self.milvus._settings.openai_api_key)
             now = int(time.time())
 
             for topic in topics:

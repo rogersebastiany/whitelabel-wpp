@@ -8,3 +8,8 @@ build/
 .ruff_cache/
 .pytest_cache/
 uv.lock
+
+# Go bridge
+bridge/wpp-bridge
+bridge/session.db
+bridge/session_*.db

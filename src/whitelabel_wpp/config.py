@@ -4,30 +4,37 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 
 @dataclass(frozen=True)
 class Settings:
-    # Telnyx
-    telnyx_api_key: str
-    telnyx_messaging_profile_id: str
+    # Mode: "local" (whatsmeow bridge) or "telnyx" (production)
+    mode: str = "local"
+
+    # Telnyx (production mode)
+    telnyx_api_key: str = ""
+    telnyx_messaging_profile_id: str = ""
+
+    # Whatsmeow bridge (local mode)
+    bridge_url: str = "http://localhost:8080"
+    owner_phone: str = ""
 
     # OpenAI
-    openai_api_key: str
+    openai_api_key: str = ""
 
     # Neo4j
-    neo4j_uri: str
-    neo4j_user: str
-    neo4j_password: str
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
 
     # Milvus
-    milvus_uri: str
+    milvus_uri: str = "http://localhost:19530"
 
-    # AWS
-    sqs_queue_url: str
-    stage: str
+    # AWS (not used in local mode)
+    sqs_queue_url: str = ""
+    stage: str = "dev"
 
 
 @lru_cache(maxsize=1)
@@ -47,6 +54,7 @@ def _from_secrets_manager(arn: str) -> Settings:
     secrets = json.loads(resp["SecretString"])
 
     return Settings(
+        mode="telnyx",
         telnyx_api_key=secrets["TELNYX_API_KEY"],
         telnyx_messaging_profile_id=secrets.get("TELNYX_MESSAGING_PROFILE_ID", ""),
         openai_api_key=secrets.get("OPENAI_API_KEY", ""),
@@ -61,8 +69,11 @@ def _from_secrets_manager(arn: str) -> Settings:
 
 def _from_env() -> Settings:
     return Settings(
+        mode=os.environ.get("MODE", "local"),
         telnyx_api_key=os.environ.get("TELNYX_API_KEY", ""),
         telnyx_messaging_profile_id=os.environ.get("TELNYX_MESSAGING_PROFILE_ID", ""),
+        bridge_url=os.environ.get("BRIDGE_URL", "http://localhost:8080"),
+        owner_phone=os.environ.get("OWNER_PHONE", ""),
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
         neo4j_uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
         neo4j_user=os.environ.get("NEO4J_USER", "neo4j"),

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def extract_topics(text: str, group_id: str) -> list[Topic]:
+async def extract_topics(text: str, group_id: str, openai_api_key: str = "") -> list[Topic]:
     """Process-and-discard: text enters, topics leave. Text never stored.
 
     1. cognee.add(text) — in-memory processing
@@ -39,8 +39,11 @@ async def extract_topics(text: str, group_id: str) -> list[Topic]:
     from cognee.api.v1.search import SearchType
 
     try:
-        # Feed text to Cognee (temporary dataset)
-        dataset_name = f"wpp_{group_id}_temp"
+        if openai_api_key:
+            cognee.config.set_llm_api_key(openai_api_key)
+
+        safe_id = group_id.replace(".", "_").replace("@", "_").replace(" ", "_")
+        dataset_name = f"wpp_{safe_id}_temp"
         await cognee.add(text, dataset_name=dataset_name)
 
         # Extract entities and relationships
