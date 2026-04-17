@@ -1,0 +1,109 @@
+WHITELABEL-WPP — POC Report
+Date: 2026-04-16
+Status: Local POC running, pipeline validated end-to-end
+
+========================================
+PROJECT SUMMARY
+========================================
+
+WhatsApp Group Analytics Platform — white-label SaaS that listens to group
+conversations, extracts insights (topics, engagement, key members), and lets
+group owners query their data through a 1:1 WhatsApp chat.
+
+LGPD compliant: no raw messages stored. Only metadata, topics, and aggregated
+summaries are persisted.
+
+========================================
+DEVELOPMENT HISTORY (12 commits)
+========================================
+
+1. Initial scaffold — README, pyproject.toml, .env.example
+2. CloudFormation stack — API Gateway, Lambda, SQS, EventBridge, CloudWatch
+3. Full infra deployed — Secrets Manager, ECS Fargate (Spot, auto-scale 0→3),
+   ALB, VPC in sa-east-1
+4. Spec-driven design — module structure, SQS schemas, Cypher queries, Milvus
+   collections, Cognee integration, owner chat interface
+5. LanceDB role fix — sync bridge between Cognee and Milvus
+6. Multi-tenancy spec — shared instances, partition by group_id
+7. Telnyx eSIM onboarding spec — programmatic provisioning
+8. Switch to Telnyx BSP — single vendor (numbers, WABA, messaging, webhooks)
+9. Core processor — config, models, all clients, processor dispatch, owner
+   chat handler, webhook handler
+10. Local POC — Go whatsmeow bridge, docker-compose (Neo4j + Milvus + etcd +
+    MinIO + Attu), dual-mode config, WhatsmeowClient
+11. Intent tuning — silence unknown intents, add PT-BR keywords
+12. POC hardening — sent-ID echo filter, OpenAI topic extraction, data-driven
+    summaries with short LLM blurb
+
+========================================
+LIVE TEST STATISTICS
+========================================
+
+Group monitored: Mentoria FIRE
+Group JID: 120363045927901595@g.us
+Owner: Roger (555182741369)
+
+Neo4j Graph:
+  - 42 interactions captured
+  - 5 members detected
+  - 26 topics extracted
+  - 2 summaries generated
+  - 2 replies tracked
+  - 1 owner registered
+
+Members detected:
+  - rogersebastiany (555182741369)
+  - jimihaensgen (555190147159)
+  - Hian (554896734943)
+  - Ian V. Salgado (559189579418)
+  - Raphael Motta (5521985182823)
+
+Owner chat commands tested:
+  - summary ✓ (data-driven + LLM blurb in PT-BR)
+  - topics ✓ (26 recurring topics listed)
+  - key members ✓ (IQS leaderboard)
+  - engagement ✓ (7-day activity metrics)
+
+========================================
+WHAT'S WORKING
+========================================
+
+✓ WhatsApp group messages received via whatsmeow bridge
+✓ Interaction metadata stored in Neo4j (no raw text — LGPD)
+✓ Topic extraction via OpenAI GPT-4o-mini
+✓ Topics stored in Neo4j + Milvus with semantic dedup (cosine > 0.85)
+✓ Owner 1:1 chat interface (summary, topics, key members, engagement)
+✓ Reply loop prevention (sent-ID tracking)
+✓ Multi-member detection from group messages
+✓ Reply-to context tracking
+
+========================================
+WHAT'S NEXT
+========================================
+
+- Member profile command (needs LLM-based intent classifier)
+- Telnyx BSP integration (replace whatsmeow bridge for production)
+- LanceDB → Milvus sync (Cognee production integration)
+- Scheduled jobs (daily summaries, weekly engagement, topic recurrence)
+- Multi-owner support (multiple owners per group)
+- Web dashboard (Cognito + frontend)
+
+========================================
+TECH STACK
+========================================
+
+Python 3.12, Go 1.24, FastAPI, Neo4j, Milvus, OpenAI GPT-4o-mini,
+whatsmeow (local), Telnyx BSP (production), AWS (Lambda, API Gateway,
+SQS, ECS Fargate, ALB, ECR, Secrets Manager, EventBridge, CloudWatch),
+CloudFormation, Docker Compose, uv
+
+========================================
+COSTS SO FAR
+========================================
+
+OpenAI API: < $0.01 (topic extraction + summary blurbs for ~42 messages)
+Infrastructure: $0 (all local Docker containers)
+Telnyx: $0 (not used yet, POC validates pipeline before production)
+AWS (deployed but idle): < $17/mo (ALB fixed cost is the biggest item)
+
+Total POC spend: < $0.01
